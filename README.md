@@ -1,4 +1,4 @@
-# Remote Control Application
+# KeyMoCast
 
 This is a project that creates a remote mouse and keyboard solution on your Android smartphone that connects to a desktop running my custom WebSocket server. This was designed initially so I could control the desktop I have in my living room from my couch without having to buy a mouse that can connect via 2.4GHz from that far away. So basically it was born out of laziness.
 
