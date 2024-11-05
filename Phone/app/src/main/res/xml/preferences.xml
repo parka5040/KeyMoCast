@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory
+        android:title="@string/settings_connection_title"
+        app:iconSpaceReserved="false">
+
+        <EditTextPreference
+            android:key="server_ip"
+            android:title="@string/settings_server_ip"
+            android:summary="@string/settings_server_ip_summary"
+            android:defaultValue=""
+            app:iconSpaceReserved="false"
+            app:useSimpleSummaryProvider="true" />
+
+        <EditTextPreference
+            android:key="port_number"
+            android:title="@string/settings_port_title"
+            android:summary="@string/settings_port_summary"
+            android:defaultValue="8080"
+            app:iconSpaceReserved="false"
+            app:useSimpleSummaryProvider="true" />
+
+        <EditTextPreference
+            android:key="saved_pin"
+            android:title="@string/settings_saved_pin_title"
+            android:summary="@string/settings_saved_pin_summary"
+            android:defaultValue=""
+            android:password="true"
+            app:iconSpaceReserved="false"
+            app:useSimpleSummaryProvider="true" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        android:title="@string/settings_appearance_title"
+        app:iconSpaceReserved="false">
+
+        <SwitchPreferenceCompat
+            android:key="night_mode"
+            android:title="@string/settings_night_mode_title"
+            android:summary="@string/settings_night_mode_summary"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        android:title="@string/settings_touchpad_title"
+        app:iconSpaceReserved="false">
+
+        <SeekBarPreference
+            android:key="double_tap_time"
+            android:title="@string/settings_double_tap_time_title"
+            android:summary="@string/settings_double_tap_time_summary"
+            android:defaultValue="300"
+            android:max="600"
+            app:min="100"
+            app:showSeekBarValue="true"
+            app:seekBarIncrement="50"
+            app:iconSpaceReserved="false"/>
+
+        <SeekBarPreference
+            android:key="scroll_scaling"
+            android:title="@string/settings_scroll_scaling_title"
+            android:summary="@string/settings_scroll_scaling_summary"
+            android:defaultValue="50"
+            android:max="100"
+            app:min="10"
+            app:showSeekBarValue="true"
+            app:seekBarIncrement="5"
+            app:iconSpaceReserved="false"/>
+
+        <SeekBarPreference
+            android:key="move_threshold"
+            android:title="@string/settings_move_threshold_title"
+            android:summary="@string/settings_move_threshold_summary"
+            android:defaultValue="10"
+            android:max="30"
+            app:min="5"
+            app:showSeekBarValue="true"
+            app:seekBarIncrement="1"
+            app:iconSpaceReserved="false"/>
+
+        <SeekBarPreference
+            android:key="click_timeout"
+            android:title="@string/settings_click_timeout_title"
+            android:summary="@string/settings_click_timeout_summary"
+            android:defaultValue="150"
+            android:max="300"
+            app:min="50"
+            app:showSeekBarValue="true"
+            app:seekBarIncrement="25"
+            app:iconSpaceReserved="false"/>
+
+    </PreferenceCategory>
+
+</PreferenceScreen>

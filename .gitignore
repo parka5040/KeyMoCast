@@ -1,0 +1,58 @@
+# Android Studio
+*.iml
+.gradle/
+.idea/
+local.properties
+build/
+captures/
+.navigation/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.log
+
+# Android NDK
+.externalNativeBuild/
+.cxx/
+
+# Visual Studio / .NET
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# IDE files
+.vs/
+*.suo
+*.user
+*.userosscache
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# OS specific
+.DS_Store
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+
+# Backup & temp files
+*.bak
+*.swp
+*.tmp
+*~
