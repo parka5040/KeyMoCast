@@ -2,7 +2,7 @@
 
 This is a project that creates a remote mouse and keyboard solution on your Android smartphone that connects to a desktop running my custom WebSocket server. This was designed initially so I could control the desktop I have in my living room from my couch without having to buy a mouse that can connect via 2.4GHz from that far away. So basically it was born out of laziness.
 
-Though, this was great as while I have experience in C#, I've never done this much Kotlin before. Great learning experience. It works and the Releases page has both the APK and the executable for the app and the server respectively.
+Great learning experience. It works and the Releases page has both the APK and the executable for the app and the server respectively.
 
 In the future, I'll actually add a non-default logo for this app and make the solution more seamless.
 
