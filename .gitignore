@@ -38,6 +38,7 @@ x86/
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
+.vscode
 
 # .NET Core
 project.lock.json

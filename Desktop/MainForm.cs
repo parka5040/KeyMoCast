@@ -12,8 +12,8 @@ namespace RemoteControlServer
         private IWebSocketConnection? currentConnection;
         private string currentPin = string.Empty;
         private readonly Dictionary<string, Action<dynamic>> messageHandlers;
-        private Label statusLabel;
-        private TableLayoutPanel mainTableLayout;
+        private Label statusLabel = new();
+        private TableLayoutPanel mainTableLayout = new();
         private float currentDpiScale;
         private const int PIN_LENGTH = 4;
 
@@ -44,10 +44,6 @@ namespace RemoteControlServer
 
             // This kinda works
             this.ResizeEnd += (s, e) => this.PerformLayout();
-
-            // Get rid of non-null reqs
-            statusLabel = new Label();
-            mainTableLayout = new TableLayoutPanel(); 
         }
 
         private void SetupLayout()
@@ -84,7 +80,7 @@ namespace RemoteControlServer
         private Font ScaleFont(string familyName, float size,
                                FontStyle style = FontStyle.Regular)
 
-            => new(familyName, size * currentDpiScale, style);
+            => new Font(familyName, size * currentDpiScale, style);
 
         private void InitializeControls()
         {
@@ -228,8 +224,23 @@ namespace RemoteControlServer
                 ["mouseClick"] = HandleMouseClick,
                 ["scroll"] = HandleScroll,
                 ["keyInput"] = HandleKeyInput,
-                ["authenticate"] = HandleAuthentication
+                ["authenticate"] = HandleAuthentication,
+                ["keepAlive"] = HandleKeepAlive
             };
+        }
+
+        private void HandleKeepAlive(dynamic data)
+        {
+            if (currentConnection == null)
+                return;
+
+            var response = new
+            {
+                type = "ack",
+                receivedType = "keepAlive"
+            };
+
+            currentConnection.Send(JsonConvert.SerializeObject(response));
         }
 
         private void UpdateStatus(string status)
@@ -277,28 +288,28 @@ namespace RemoteControlServer
                         {
                             socket.OnOpen = () =>
                             {
-                              if (currentConnection != null)
-                              {
-                                  socket.Close();
-                                  return;
-                              }
-                              currentConnection = socket;
-                              UpdateStatus($"Phone connected from {socket.ConnectionInfo.ClientIpAddress}, waiting for authentication");
+                                if (currentConnection != null)
+                                {
+                                    socket.Close();
+                                    return;
+                                }
+                                currentConnection = socket;
+                                UpdateStatus($"Phone connected from {socket.ConnectionInfo.ClientIpAddress}, waiting for authentication");
                             };
 
                             socket.OnClose = () =>
                             {
-                              if (currentConnection == socket)
-                              {
-                                  currentConnection = null;
-                                  UpdateStatus("Phone disconnected");
-                              }
+                                if (currentConnection == socket)
+                                {
+                                    currentConnection = null;
+                                    UpdateStatus("Phone disconnected");
+                                }
                             };
 
                             socket.OnMessage = message =>
                             {
-                              if (message != null)
-                                  HandleMessage(socket, message);
+                                if (message != null)
+                                    HandleMessage(socket, message);
                             };
                         });
                 }
@@ -455,7 +466,7 @@ namespace RemoteControlServer
                         }));
 
                 }
-                catch {}
+                catch { }
             }
         }
 
@@ -543,13 +554,13 @@ namespace RemoteControlServer
                 else
                     inputSimulator.Keyboard.TextEntry(text);
             }
-            catch {}
+            catch { }
         }
 
         private void HandleKeyboardShortcut(string keyCommand)
         {
             string[] keys = keyCommand.Split('+');
-            List<VirtualKeyCode> modifiers = [];
+            List<VirtualKeyCode> modifiers = new();
             VirtualKeyCode? mainKey = null;
 
             foreach (string key in keys)
@@ -602,7 +613,7 @@ namespace RemoteControlServer
                     return;
             }
 
-            if (keyCode.Contains('+'))
+            if (keyCode.Contains("+"))
                 HandleKeyboardShortcut(keyCode);
         }
 
