@@ -8,7 +8,7 @@ namespace RemoteControlServer
     public partial class MainForm : Form
     {
         private readonly InputSimulator inputSimulator;
-        private readonly WebSocketServer? server;
+        private WebSocketServer? server;
         private IWebSocketConnection? currentConnection;
         private string currentPin = string.Empty;
         private readonly Dictionary<string, Action<dynamic>> messageHandlers;
@@ -16,6 +16,15 @@ namespace RemoteControlServer
         private TableLayoutPanel mainTableLayout = new();
         private float currentDpiScale;
         private const int PIN_LENGTH = 4;
+
+        private DateTime lastKeepAliveReceived = DateTime.Now;
+        private DateTime lastMessageSent = DateTime.Now;
+        private System.Threading.Timer? keepAliveMonitorTimer;
+        private System.Threading.Timer? periodicPingTimer;
+        private const int KEEP_ALIVE_CHECK_INTERVAL = 5000;  // 5 seconds
+        private const int KEEP_ALIVE_TIMEOUT = 45000;        // 45 seconds
+        private const int PING_INTERVAL = 30000;             // 30 seconds
+        private bool isClosing = false;
 
         private readonly string instructionList = String.Join(
                       Environment.NewLine + Environment.NewLine,
@@ -225,7 +234,8 @@ namespace RemoteControlServer
                 ["scroll"] = HandleScroll,
                 ["keyInput"] = HandleKeyInput,
                 ["authenticate"] = HandleAuthentication,
-                ["keepAlive"] = HandleKeepAlive
+                ["keepAlive"] = HandleKeepAlive,
+                ["ping"] = HandlePing
             };
         }
 
@@ -237,10 +247,29 @@ namespace RemoteControlServer
             var response = new
             {
                 type = "ack",
-                receivedType = "keepAlive"
+                receivedType = "keepAlive",
+                timestamp = data.timestamp
             };
 
             currentConnection.Send(JsonConvert.SerializeObject(response));
+            lastMessageSent = DateTime.Now;
+            lastKeepAliveReceived = DateTime.Now;
+        }
+
+        private void HandlePing(dynamic data)
+        {
+            if (currentConnection == null)
+                return;
+
+            var response = new
+            {
+                type = "pong",
+                timestamp = data.timestamp
+            };
+
+            currentConnection.Send(JsonConvert.SerializeObject(response));
+            lastMessageSent = DateTime.Now;
+            lastKeepAliveReceived = DateTime.Now;
         }
 
         private void UpdateStatus(string status)
@@ -278,62 +307,216 @@ namespace RemoteControlServer
                 }
 
                 int port = AppSettings.Port;
-                server?.Dispose();
+                StopServer();
+                isClosing = false;
 
                 foreach (var address in localAddresses)
                 {
                     var wsServer = new WebSocketServer($"ws://{address}:{port}");
-                    wsServer.Start(
-                        socket =>
+                    wsServer.RestartAfterListenError = true;
+
+                    wsServer.Start(socket =>
+                    {
+                        socket.OnOpen = () =>
                         {
-                            socket.OnOpen = () =>
+                            if (currentConnection != null)
                             {
-                                if (currentConnection != null)
-                                {
-                                    socket.Close();
-                                    return;
-                                }
-                                currentConnection = socket;
-                                UpdateStatus($"Phone connected from {socket.ConnectionInfo.ClientIpAddress}, waiting for authentication");
-                            };
+                                socket.Close();
+                                return;
+                            }
+                            currentConnection = socket;
+                            lastKeepAliveReceived = DateTime.Now;
+                            lastMessageSent = DateTime.Now;
+                            StartConnectionMonitoring();
+                            UpdateStatus($"Phone connected from {socket.ConnectionInfo.ClientIpAddress}, waiting for authentication");
+                        };
 
-                            socket.OnClose = () =>
+                        socket.OnClose = () =>
+                        {
+                            if (currentConnection == socket)
                             {
-                                if (currentConnection == socket)
-                                {
-                                    currentConnection = null;
-                                    UpdateStatus("Phone disconnected");
-                                }
-                            };
+                                HandleDisconnection();
+                            }
+                        };
 
-                            socket.OnMessage = message =>
+                        socket.OnMessage = message =>
+                        {
+                            if (message != null)
                             {
-                                if (message != null)
-                                    HandleMessage(socket, message);
-                            };
-                        });
+                                HandleMessage(socket, message);
+                                lastKeepAliveReceived = DateTime.Now;
+                            }
+                        };
+                    });
                 }
-                var addressList = string.Join(Environment.NewLine, localAddresses);
 
                 UpdateStatus($"Server running on port {port}.");
-
-                foreach (Control control in Controls)
-                {
-                    if (control is TextBox textBox && textBox.Name == "instructions")
-                    {
-                        textBox.Text = instructionList;
-                        break;
-                    }
-                }
-
             }
-
             catch (Exception ex)
             {
                 MessageBox.Show($"Failed to start server: {ex.Message}", "Error",
                                 MessageBoxButtons.OK, MessageBoxIcon.Error);
                 UpdateStatus("Server failed to start");
             }
+        }
+
+        private void StopServer()
+        {
+            isClosing = true;
+            StopConnectionMonitoring();
+            if (currentConnection != null)
+            {
+                try
+                {
+                    currentConnection.Close();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error closing connection: {ex.Message}");
+                }
+                currentConnection = null;
+            }
+            if (server != null)
+            {
+                try
+                {
+                    server.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error disposing server: {ex.Message}");
+                }
+                server = null;
+            }
+        }
+
+        private void StartConnectionMonitoring()
+        {
+            StopConnectionMonitoring();
+
+            keepAliveMonitorTimer = new System.Threading.Timer(
+                CheckConnectionStatus,
+                null,
+                KEEP_ALIVE_CHECK_INTERVAL,
+                KEEP_ALIVE_CHECK_INTERVAL);
+
+            periodicPingTimer = new System.Threading.Timer(
+                SendPeriodicPing,
+                null,
+                PING_INTERVAL,
+                PING_INTERVAL);
+        }
+
+        private void StopConnectionMonitoring()
+        {
+            if (keepAliveMonitorTimer != null)
+            {
+                keepAliveMonitorTimer.Dispose();
+                keepAliveMonitorTimer = null;
+            }
+            if (periodicPingTimer != null)
+            {
+                periodicPingTimer.Dispose();
+                periodicPingTimer = null;
+            }
+        }
+
+        private void CheckConnectionStatus(object? state)
+        {
+            if (isClosing) return;
+
+            try
+            {
+                if (currentConnection != null)
+                {
+                    var timeSinceLastKeepAlive = DateTime.Now - lastKeepAliveReceived;
+                    if (timeSinceLastKeepAlive.TotalMilliseconds > KEEP_ALIVE_TIMEOUT)
+                    {
+                        if (InvokeRequired)
+                        {
+                            Invoke(new Action(() =>
+                            {
+                                HandleDisconnection("Connection timeout");
+                            }));
+                        }
+                        else
+                        {
+                            HandleDisconnection("Connection timeout");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in connection monitor: {ex.Message}");
+            }
+        }
+
+        private void SendPeriodicPing(object? state)
+        {
+            if (isClosing) return;
+
+            try
+            {
+                if (currentConnection != null)
+                {
+                    var timeSinceLastMessage = DateTime.Now - lastMessageSent;
+                    if (timeSinceLastMessage.TotalMilliseconds > PING_INTERVAL)
+                    {
+                        if (InvokeRequired)
+                        {
+                            Invoke(new Action(() =>
+                            {
+                                SendPing();
+                            }));
+                        }
+                        else
+                        {
+                            SendPing();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending ping: {ex.Message}");
+            }
+        }
+
+        private void SendPing()
+        {
+            if (currentConnection == null || isClosing) return;
+
+            try
+            {
+                var message = new
+                {
+                    type = "ping",
+                    timestamp = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+                };
+                currentConnection.Send(JsonConvert.SerializeObject(message));
+                lastMessageSent = DateTime.Now;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending ping: {ex.Message}");
+                HandleDisconnection("Failed to send ping");
+            }
+        }
+
+        private void HandleDisconnection(string reason = "Connection closed")
+        {
+            if (currentConnection != null)
+            {
+                try
+                {
+                    currentConnection.Close();
+                }
+                catch { }
+                currentConnection = null;
+            }
+            StopConnectionMonitoring();
+            UpdateStatus($"Phone disconnected: {reason}");
         }
 
         private void RestartServer()
@@ -375,98 +558,61 @@ namespace RemoteControlServer
                     return;
                 }
 
-                if (string.IsNullOrEmpty(message))
-                {
-                    socket.Send(
-                        JsonConvert.SerializeObject(new
-                        {
-                            type = "error",
-                            message = "Empty message received"
-                        }));
-
-                    return;
-                }
-
                 dynamic? data = JsonConvert.DeserializeObject(message);
                 if (data == null)
                 {
-                    socket.Send(
-                        JsonConvert.SerializeObject(new
-                        {
-                            type = "error",
-                            message = "Invalid message format"
-                        }));
-
+                    SendError(socket, "Invalid message format");
                     return;
                 }
 
                 string? messageType = data.type?.ToString();
                 if (string.IsNullOrEmpty(messageType))
                 {
-                    socket.Send(JsonConvert.SerializeObject(
-                        new
-                        {
-
-                            type = "error",
-
-                            message = "Message type not specified"
-
-                        }));
-
+                    SendError(socket, "Message type not specified");
                     return;
                 }
+
+                // Update last activity time for any valid message
+                lastKeepAliveReceived = DateTime.Now;
 
                 if (messageHandlers.TryGetValue(messageType, out var handler))
                 {
                     if (messageType != "authenticate" && socket != currentConnection)
                     {
-                        socket.Send(
-                            JsonConvert.SerializeObject(new
-                            {
-                                type = "error",
-                                message = "Not authenticated"
-
-                            }));
+                        SendError(socket, "Not authenticated");
                         socket.Close();
                         return;
                     }
                     handler(data);
-                    socket.Send(JsonConvert.SerializeObject(new
-                    {
-                        type = "ack",
-                        receivedType = messageType
-                    }));
-                }
 
+                    // Send acknowledgment
+                    var response = new { type = "ack", receivedType = messageType };
+                    socket.Send(JsonConvert.SerializeObject(response));
+                    lastMessageSent = DateTime.Now;
+                }
                 else
                 {
-                    socket.Send(JsonConvert.SerializeObject(
-                        new
-                        {
-                            type = "error",
-                            message = $"Unknown message type: {messageType}"
-                        }));
+                    SendError(socket, $"Unknown message type: {messageType}");
                 }
-
             }
-
             catch (Exception ex)
             {
-                UpdateStatus($"Error: {ex.Message}");
-
                 Console.WriteLine($"Error handling message: {ex.Message}");
+                SendError(socket, "Internal server error");
+            }
+        }
 
-                try
-                {
-                    socket.Send(
-                        JsonConvert.SerializeObject(new
-                        {
-                            type = "error",
-                            message = "Internal server error"
-                        }));
-
-                }
-                catch { }
+        private void SendError(IWebSocketConnection socket, string message)
+        {
+            try
+            {
+                var error = new { type = "error", message = message };
+                socket.Send(JsonConvert.SerializeObject(error));
+                lastMessageSent = DateTime.Now;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending error message: {ex.Message}");
             }
         }
 
@@ -560,7 +706,7 @@ namespace RemoteControlServer
         private void HandleKeyboardShortcut(string keyCommand)
         {
             string[] keys = keyCommand.Split('+');
-            List<VirtualKeyCode> modifiers = new();
+            List<VirtualKeyCode> modifiers = [];
             VirtualKeyCode? mainKey = null;
 
             foreach (string key in keys)
@@ -613,14 +759,14 @@ namespace RemoteControlServer
                     return;
             }
 
-            if (keyCode.Contains("+"))
+            if (keyCode.Contains('+'))
                 HandleKeyboardShortcut(keyCode);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             base.OnFormClosing(e);
-            server?.Dispose();
+            StopServer();
         }
     }
 }

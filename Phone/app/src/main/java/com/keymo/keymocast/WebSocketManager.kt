@@ -10,30 +10,38 @@ import okhttp3.*
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
+import java.io.IOException
 
 class WebSocketManager(context: Context) : CoroutineScope {
     private var webSocket: WebSocket? = null
     private val preferences: SharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
     private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .pingInterval(5, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private var currentPin: String = ""
     private var currentServerIp: String = ""
     private var currentPort: Int = 0
     private var reconnectJob: Job? = null
-    private var reconnectAttempts = 0
     private var keepAliveJob: Job? = null
     private var isManuallyDisconnected = false
+    private var lastKeepAliveResponse = 0L
+    private var lastPingSent = 0L
+    private var keepAliveMonitorJob: Job? = null
+    private var connectionMonitorJob: Job? = null
+    private var reconnectAttempts = 0
+    private var consecutiveFailures = 0
+    private var lastMessageSentTime = 0L
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState
 
     override val coroutineContext: CoroutineContext
-        get() = Dispatchers.Main + Job()
+        get() = Dispatchers.Main + SupervisorJob()
 
     fun getSavedPin(): String {
         return preferences.getString(SAVED_PIN, "") ?: ""
@@ -47,18 +55,15 @@ class WebSocketManager(context: Context) : CoroutineScope {
         currentServerIp = serverIp
         currentPort = port
         currentPin = pin
-        reconnectAttempts = 0
         isManuallyDisconnected = false
-
+        reconnectAttempts = 0
+        consecutiveFailures = 0
         disconnect(isManual = false)
         establishConnection()
     }
 
     private fun establishConnection() {
-        // Check if it's user disconnect or the Websocket timed out
-        if (isManuallyDisconnected) {
-            return
-        }
+        if (isManuallyDisconnected) return
 
         val request = Request.Builder()
             .url("ws://$currentServerIp:$currentPort")
@@ -67,9 +72,121 @@ class WebSocketManager(context: Context) : CoroutineScope {
         try {
             webSocket = client.newWebSocket(request, createWebSocketListener())
             startKeepAlive()
+            startKeepAliveMonitor()
+            startConnectionMonitor()
         } catch (e: Exception) {
-            _connectionState.value = ConnectionState.Error("Failed to create WebSocket: ${e.message}")
-            handleReconnection()
+            handleConnectionError("Failed to create WebSocket: ${e.message}")
+        }
+    }
+
+    private fun handleConnectionError(message: String) {
+        _connectionState.value = ConnectionState.Error(message)
+        consecutiveFailures++
+
+        if (!isManuallyDisconnected) {
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                disconnect(isManual = true)
+                _connectionState.value = ConnectionState.Error("Connection lost permanently after $MAX_CONSECUTIVE_FAILURES failures")
+            } else {
+                reconnectWithExponentialBackoff()
+            }
+        }
+    }
+
+    private fun startConnectionMonitor() {
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = launch {
+            while (isActive && !isManuallyDisconnected) {
+                delay(CONNECTION_MONITOR_INTERVAL)
+                if (_connectionState.value is ConnectionState.Authenticated) {
+                    checkConnectionHealth()
+                }
+            }
+        }
+    }
+
+    private fun checkConnectionHealth() {
+        val now = System.currentTimeMillis()
+        val timeSinceLastResponse = now - lastKeepAliveResponse
+        val timeSinceLastMessage = now - lastMessageSentTime
+
+        if (timeSinceLastResponse > KEEP_ALIVE_TIMEOUT) {
+            handleConnectionError("No response received for ${KEEP_ALIVE_TIMEOUT/1000} seconds")
+            return
+        }
+
+        if (timeSinceLastMessage > PING_INTERVAL) {
+            sendPing()
+        }
+    }
+
+    private fun sendPing() {
+        try {
+            val message = JSONObject().apply {
+                put("type", "ping")
+                put("timestamp", System.currentTimeMillis())
+            }
+            sendWebSocketMessage(message.toString())
+            lastPingSent = System.currentTimeMillis()
+        } catch (e: Exception) {
+            handleConnectionError("Failed to send ping: ${e.message}")
+        }
+    }
+
+    private fun sendWebSocketMessage(message: String): Boolean {
+        return try {
+            val ws = webSocket
+            if (ws != null) {
+                val sent = ws.send(message)
+                if (sent) {
+                    lastMessageSentTime = System.currentTimeMillis()
+                    consecutiveFailures = 0  // Reset failure count on successful send
+                }
+                sent
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            handleConnectionError("Send failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun startKeepAliveMonitor() {
+        keepAliveMonitorJob?.cancel()
+        keepAliveMonitorJob = launch {
+            while (isActive && !isManuallyDisconnected) {
+                delay(KEEP_ALIVE_MONITOR_INTERVAL)
+                if (_connectionState.value is ConnectionState.Authenticated) {
+                    val timeSinceLastResponse = System.currentTimeMillis() - lastKeepAliveResponse
+                    if (timeSinceLastResponse > KEEP_ALIVE_TIMEOUT) {
+                        handleConnectionError("Keep-alive timeout exceeded")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun reconnectWithExponentialBackoff() {
+        if (isManuallyDisconnected) return
+
+        reconnectJob?.cancel()
+        reconnectJob = launch {
+            while (isActive && !isManuallyDisconnected &&
+                _connectionState.value !is ConnectionState.Authenticated &&
+                consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+
+                val delayTime = minOf(
+                    INITIAL_RECONNECT_DELAY * (1 shl minOf(reconnectAttempts, 5)),
+                    MAX_RECONNECT_DELAY
+                )
+                delay(delayTime)
+
+                if (!isManuallyDisconnected) {
+                    establishConnection()
+                    reconnectAttempts++
+                }
+            }
         }
     }
 
@@ -78,38 +195,73 @@ class WebSocketManager(context: Context) : CoroutineScope {
             if (!isManuallyDisconnected) {
                 _connectionState.value = ConnectionState.Connected
                 sendAuthenticationMessage(currentPin)
+                lastKeepAliveResponse = System.currentTimeMillis()
+                lastPingSent = System.currentTimeMillis()
+                lastMessageSentTime = System.currentTimeMillis()
                 reconnectAttempts = 0
+                consecutiveFailures = 0
             } else {
                 webSocket.close(1000, "Manual disconnect active")
             }
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            handleMessage(text)
+            try {
+                lastKeepAliveResponse = System.currentTimeMillis()
+                val json = JSONObject(text)
+                when (json.getString("type")) {
+                    "authResponse" -> {
+                        val success = json.getBoolean("success")
+                        if (success) {
+                            _connectionState.value = ConnectionState.Authenticated
+                            savePin(currentPin)
+                            consecutiveFailures = 0
+                        } else {
+                            _connectionState.value = ConnectionState.AuthenticationFailed
+                            _connectionState.value = ConnectionState.Error("error_invalid_pin")
+                            disconnect(isManual = true)
+                        }
+                    }
+                    "error" -> {
+                        val errorMsg = json.getString("message")
+                        _connectionState.value = ConnectionState.Error(errorMsg)
+                    }
+                    "ack", "pong" -> {
+                        lastKeepAliveResponse = System.currentTimeMillis()
+                        consecutiveFailures = 0
+                    }
+                }
+            } catch (e: Exception) {
+                handleConnectionError("Failed to parse server message")
+            }
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            _connectionState.value = ConnectionState.Disconnecting
-            stopKeepAlive()
+            if (!isManuallyDisconnected) {
+                _connectionState.value = ConnectionState.Disconnecting
+            }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            _connectionState.value = ConnectionState.Disconnected
             if (!isManuallyDisconnected) {
-                handleReconnection()
+                _connectionState.value = ConnectionState.Disconnected
+                reconnectWithExponentialBackoff()
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            _connectionState.value = ConnectionState.Error(t.message ?: "Unknown error")
-            if (!isManuallyDisconnected) {
-                handleReconnection()
+            if (t is IOException && t.message?.contains("Broken pipe") == true) {
+                handleConnectionError("Connection broken: ${t.message}")
+            } else {
+                handleConnectionError(t.message ?: "Unknown error")
             }
         }
     }
 
     private fun startKeepAlive() {
         keepAliveJob?.cancel()
+        lastKeepAliveResponse = System.currentTimeMillis()
+        lastMessageSentTime = System.currentTimeMillis()
         keepAliveJob = launch {
             while (isActive && !isManuallyDisconnected) {
                 delay(KEEP_ALIVE_INTERVAL)
@@ -123,68 +275,28 @@ class WebSocketManager(context: Context) : CoroutineScope {
     private fun stopKeepAlive() {
         keepAliveJob?.cancel()
         keepAliveJob = null
+        keepAliveMonitorJob?.cancel()
+        keepAliveMonitorJob = null
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = null
     }
 
     private fun sendKeepAlive() {
         if (!isManuallyDisconnected) {
             val message = JSONObject().apply {
                 put("type", "keepAlive")
+                put("timestamp", System.currentTimeMillis())
             }
-            webSocket?.send(message.toString())
-        }
-    }
-
-    private fun handleReconnection() {
-        if (!isManuallyDisconnected &&
-            reconnectAttempts < MAX_RECONNECT_ATTEMPTS &&
-            _connectionState.value !is ConnectionState.AuthenticationFailed) {
-
-            reconnectJob?.cancel()
-            reconnectJob = launch {
-                delay(RECONNECT_DELAY)
-                reconnectAttempts++
-                _connectionState.value = ConnectionState.Disconnected
-                establishConnection()
-            }
+            sendWebSocketMessage(message.toString())
         }
     }
 
     private fun sendAuthenticationMessage(pin: String) {
-        if (!isManuallyDisconnected) {
-            val authMessage = JSONObject().apply {
-                put("type", "authenticate")
-                put("pin", pin)
-            }
-            webSocket?.send(authMessage.toString())
+        val authMessage = JSONObject().apply {
+            put("type", "authenticate")
+            put("pin", pin)
         }
-    }
-
-    private fun handleMessage(message: String) {
-        try {
-            val json = JSONObject(message)
-            when (json.getString("type")) {
-                "authResponse" -> {
-                    val success = json.getBoolean("success")
-                    if (success) {
-                        _connectionState.value = ConnectionState.Authenticated
-                        savePin(currentPin)
-                    } else {
-                        _connectionState.value = ConnectionState.AuthenticationFailed
-                        _connectionState.value = ConnectionState.Error("error_invalid_pin")
-                        disconnect(isManual = true)
-                    }
-                }
-                "error" -> {
-                    val errorMsg = json.getString("message")
-                    _connectionState.value = ConnectionState.Error(errorMsg)
-                }
-                "ack" -> {
-                    json.getString("receivedType")
-                }
-            }
-        } catch (e: Exception) {
-            _connectionState.value = ConnectionState.Error("Failed to parse server message")
-        }
+        sendWebSocketMessage(authMessage.toString())
     }
 
     fun sendMouseMove(deltaX: Float, deltaY: Float, sensitivity: Float = 1.0f) {
@@ -196,7 +308,7 @@ class WebSocketManager(context: Context) : CoroutineScope {
             put("deltaY", deltaY)
             put("sensitivity", sensitivity)
         }
-        webSocket?.send(message.toString())
+        sendWebSocketMessage(message.toString())
     }
 
     fun sendMouseClick(isRight: Boolean = false, isDouble: Boolean = false) {
@@ -207,7 +319,7 @@ class WebSocketManager(context: Context) : CoroutineScope {
             put("button", if (isRight) "right" else "left")
             put("isDouble", isDouble)
         }
-        webSocket?.send(message.toString())
+        sendWebSocketMessage(message.toString())
     }
 
     fun sendScroll(deltaY: Int) {
@@ -217,7 +329,7 @@ class WebSocketManager(context: Context) : CoroutineScope {
             put("type", "scroll")
             put("deltaY", deltaY)
         }
-        webSocket?.send(message.toString())
+        sendWebSocketMessage(message.toString())
     }
 
     fun sendKeyInput(text: String, isSpecial: Boolean = false) {
@@ -231,7 +343,7 @@ class WebSocketManager(context: Context) : CoroutineScope {
                 put("text", text)
                 put("isSpecial", isSpecial)
             }
-            webSocket?.send(message.toString())
+            sendWebSocketMessage(message.toString())
         } catch (_: Exception) {
         }
     }
@@ -252,20 +364,20 @@ class WebSocketManager(context: Context) : CoroutineScope {
                 put("text", normalizedKeyCode)
                 put("isSpecial", true)
             }
-            webSocket?.send(message.toString())
+            sendWebSocketMessage(message.toString())
         } catch (_: Exception) {
         }
     }
 
-    // This is for the manual disconnect
     fun disconnect() {
         disconnect(isManual = true)
     }
 
-    // This is the private one for if it's manual or not
     private fun disconnect(isManual: Boolean) {
         if (isManual) {
             isManuallyDisconnected = true
+            reconnectAttempts = 0
+            consecutiveFailures = 0
         }
 
         stopKeepAlive()
@@ -274,21 +386,24 @@ class WebSocketManager(context: Context) : CoroutineScope {
         webSocket?.close(1000, if (isManual) "User initiated disconnect" else "System disconnect")
         webSocket = null
 
-        _connectionState.value = ConnectionState.Disconnected
+        if (isManual) {
+            _connectionState.value = ConnectionState.Disconnected
+        }
     }
 
     companion object {
         const val SAVED_PIN = "saved_pin"
-        const val MAX_RECONNECT_ATTEMPTS = 5
-        const val KEEP_ALIVE_INTERVAL = 5000L // 5 seconds
-        const val RECONNECT_DELAY = 2000L // 2 seconds
+        const val KEEP_ALIVE_INTERVAL = 15000L
+        const val KEEP_ALIVE_MONITOR_INTERVAL = 5000L
+        const val KEEP_ALIVE_TIMEOUT = 45000L
+        const val INITIAL_RECONNECT_DELAY = 1000L
+        const val MAX_RECONNECT_DELAY = 10000L
+        const val CONNECTION_MONITOR_INTERVAL = 5000L
+        const val PING_INTERVAL = 30000L
+        const val MAX_CONSECUTIVE_FAILURES = 5
 
         private val VALID_SPECIAL_KEYS = setOf(
-            "BACK",
-            "RETURN",
-            "TAB",
-            "ESCAPE",
-            "DELETE"
+            "BACK", "RETURN", "TAB", "ESCAPE", "DELETE"
         )
     }
 
